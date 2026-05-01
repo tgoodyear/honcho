@@ -22,8 +22,8 @@ if not os.getenv("PYTHON_DOTENV_DISABLED"):
 
 logger = logging.getLogger(__name__)
 
-ModelTransport = Literal["anthropic", "openai", "gemini"]
-EmbeddingTransport = Literal["openai", "gemini"]
+ModelTransport = Literal["anthropic", "openai", "gemini", "azure_openai"]
+EmbeddingTransport = Literal["openai", "gemini", "azure_openai"]
 EmbeddingDimensionsMode = Literal["auto", "always", "never"]
 
 # OpenAI-compatible models that reject the `dimensions=` request parameter.
@@ -68,6 +68,7 @@ class ModelOverrideSettings(BaseModel):
     api_key: str | None = None
     api_key_env: str | None = None
     base_url: str | None = None
+    api_version: str | None = None
 
     provider_params: dict[str, Any] = Field(default_factory=dict)
 
@@ -95,7 +96,7 @@ def _normalize_model_transport(data: Any) -> Any:
     transport_value = update.get("transport")
     if isinstance(model_value, str) and "/" in model_value and transport_value is None:
         prefix, bare_model = model_value.split("/", 1)
-        if prefix in {"anthropic", "openai", "gemini"}:
+        if prefix in {"anthropic", "openai", "gemini", "azure_openai"}:
             update["transport"] = prefix
             update["model"] = bare_model
     return update
@@ -210,6 +211,7 @@ class ResolvedFallbackConfig(BaseModel):
 
     api_key: str | None = None
     base_url: str | None = None
+    api_version: str | None = None
 
     temperature: float | None = None
     top_p: float | None = None
@@ -245,6 +247,7 @@ class ModelConfig(BaseModel):
 
     api_key: str | None = None
     base_url: str | None = None
+    api_version: str | None = None
 
     temperature: float | None = None
     top_p: float | None = None
@@ -318,7 +321,7 @@ class ConfiguredEmbeddingModelSettings(BaseModel):
             and transport_value is None
         ):
             prefix, bare_model = model_value.split("/", 1)
-            if prefix in {"openai", "gemini"}:
+            if prefix in {"openai", "gemini", "azure_openai"}:
                 update["transport"] = prefix
                 update["model"] = bare_model
         return update
@@ -337,6 +340,7 @@ class EmbeddingModelConfig(BaseModel):
     transport: EmbeddingTransport = "openai"
     api_key: str | None = None
     base_url: str | None = None
+    api_version: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -354,7 +358,7 @@ class EmbeddingModelConfig(BaseModel):
             and transport_value is None
         ):
             prefix, bare_model = model_value.split("/", 1)
-            if prefix in {"openai", "gemini"}:
+            if prefix in {"openai", "gemini", "azure_openai"}:
                 update["transport"] = prefix
                 update["model"] = bare_model
         return update
@@ -386,6 +390,7 @@ def _resolve_fallback_config(
             fallback.overrides.api_key_env,
         ),
         base_url=fallback.overrides.base_url,
+        api_version=fallback.overrides.api_version,
         temperature=fallback.temperature,
         top_p=fallback.top_p,
         top_k=fallback.top_k,
@@ -419,6 +424,7 @@ def resolve_model_config(configured: ConfiguredModelSettings) -> ModelConfig:
             configured.overrides.api_key_env,
         ),
         base_url=configured.overrides.base_url,
+        api_version=configured.overrides.api_version,
         temperature=configured.temperature,
         top_p=configured.top_p,
         top_k=configured.top_k,
@@ -440,6 +446,8 @@ def _default_embedding_api_key(transport: EmbeddingTransport) -> str | None:
         return settings.LLM.OPENAI_API_KEY
     if transport == "gemini":
         return settings.LLM.GEMINI_API_KEY
+    if transport == "azure_openai":
+        return settings.LLM.AZURE_OPENAI_API_KEY
 
 
 def resolve_embedding_model_config(
@@ -459,6 +467,7 @@ def resolve_embedding_model_config(
         transport=configured.transport,
         api_key=api_key,
         base_url=configured.overrides.base_url,
+        api_version=configured.overrides.api_version,
     )
 
 
@@ -654,6 +663,7 @@ class LLMSettings(HonchoSettings):
     ANTHROPIC_API_KEY: str | None = None
     OPENAI_API_KEY: str | None = None
     GEMINI_API_KEY: str | None = None
+    AZURE_OPENAI_API_KEY: str | None = None
 
     # Base URLs for LLM providers (for OpenAI-compatible proxies like
     # OpenRouter, vLLM, Together, Anyscale, self-hosted, etc.)
