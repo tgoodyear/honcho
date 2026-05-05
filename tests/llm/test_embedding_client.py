@@ -200,3 +200,56 @@ def test_azure_openai_embedding_client_requires_api_version() -> None:
             max_input_tokens=8192,
             max_tokens_per_request=300_000,
         )
+
+
+@pytest.mark.asyncio
+async def test_azure_openai_embedding_client_with_entra_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``use_entra_id=True`` must use ``azure_ad_token_provider`` instead
+    of ``api_key`` when constructing the Azure embedding client."""
+    import sys
+    from unittest.mock import MagicMock
+
+    fake_embeddings = FakeOpenAIEmbeddingsAPI([0.4] * 8)
+    captured: dict[str, Any] = {}
+
+    class FakeAzureClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            self.embeddings: FakeOpenAIEmbeddingsAPI = fake_embeddings
+
+    monkeypatch.setattr("src.embedding_client.AsyncAzureOpenAI", FakeAzureClient)
+
+    mock_credential = MagicMock()
+    mock_token_provider = MagicMock(return_value="fake-token")
+
+    mock_azure_identity = MagicMock(
+        DefaultAzureCredential=MagicMock(return_value=mock_credential),
+        get_bearer_token_provider=MagicMock(return_value=mock_token_provider),
+    )
+    monkeypatch.setitem(sys.modules, "azure.identity", mock_azure_identity)
+
+    try:
+        client = _EmbeddingClient(
+            EmbeddingModelConfig(
+                transport="azure_openai",
+                model="text-embedding-3-small",
+                base_url="https://gateway.example/azure-openai",
+                api_version="2024-10-21",
+                use_entra_id=True,
+            ),
+            vector_dimensions=8,
+            max_input_tokens=8192,
+            max_tokens_per_request=300_000,
+        )
+
+        embedding = await client.embed("hello world")
+
+        assert embedding == [0.4] * 8
+        assert captured["azure_ad_token_provider"] is mock_token_provider
+        assert captured["azure_endpoint"] == "https://gateway.example/azure-openai"
+        assert captured["api_version"] == "2024-10-21"
+        assert "api_key" not in captured
+    finally:
+        sys.modules.pop("azure.identity", None)
