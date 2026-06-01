@@ -797,6 +797,18 @@ class DeriverSettings(HonchoSettings):
     # When enabled, bypasses the batch token threshold and processes work immediately
     FLUSH_ENABLED: bool = False
 
+    # Age-based escape hatch for the representation batch threshold. When > 0, a
+    # representation work unit is claimed once its oldest unprocessed message is
+    # older than this many minutes, even if its accumulated tokens are still below
+    # REPRESENTATION_BATCH_MAX_TOKENS. This prevents quiet/idle collections from
+    # stalling below the token threshold indefinitely — which also blocks their
+    # auto-dream scheduling, since dreams are triggered at the tail of
+    # representation processing. 0 disables it (legacy token-only batching).
+    REPRESENTATION_BATCH_MAX_AGE_MINUTES: Annotated[
+        int,
+        Field(default=60, ge=0),
+    ] = 60
+
     @model_validator(mode="before")
     @classmethod
     def _merge_model_config_defaults(cls, data: Any) -> Any:

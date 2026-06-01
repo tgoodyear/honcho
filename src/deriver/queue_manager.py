@@ -279,7 +279,9 @@ class QueueManager:
         """
         Get available work units that aren't being processed.
         For representation tasks, only returns work units with accumulated tokens
-        >= REPRESENTATION_BATCH_MAX_TOKENS (forced batching), unless FLUSH_ENABLED is True.
+        >= REPRESENTATION_BATCH_MAX_TOKENS (forced batching), unless FLUSH_ENABLED is
+        True or the work unit's oldest unprocessed message is older than
+        REPRESENTATION_BATCH_MAX_AGE_MINUTES (age-based flush).
         Returns a dict mapping work_unit_key to aqs_id.
         """
         limit: int = max(0, self.workers - self.get_total_owned_work_units())
@@ -294,6 +296,7 @@ class QueueManager:
                 select(
                     models.QueueItem.work_unit_key,
                     func.sum(models.Message.token_count).label("total_tokens"),
+                    func.min(models.QueueItem.created_at).label("oldest_created_at"),
                 )
                 .join(
                     models.Message,
@@ -329,17 +332,31 @@ class QueueManager:
                 )
             )
 
-            # Apply batch threshold filter (skip if FLUSH_ENABLED is True)
+            # Apply batch threshold filter (skip if FLUSH_ENABLED is True).
+            # A representation work unit is claimed when EITHER its accumulated
+            # tokens reach the batch threshold OR its oldest unprocessed message is
+            # older than REPRESENTATION_BATCH_MAX_AGE_MINUTES. The age-based escape
+            # hatch prevents quiet/idle collections from stalling below the token
+            # threshold forever (which also blocks their auto-dream scheduling).
             if not settings.DERIVER.FLUSH_ENABLED and batch_max_tokens > 0:
-                query = query.where(
-                    or_(
-                        ~work_units_subq.c.work_unit_key.startswith(
-                            representation_prefix
-                        ),
-                        func.coalesce(token_stats_subq.c.total_tokens, 0)
-                        >= batch_max_tokens,
-                    )
+                batch_max_age_minutes = (
+                    settings.DERIVER.REPRESENTATION_BATCH_MAX_AGE_MINUTES
                 )
+                batch_conditions = [
+                    ~work_units_subq.c.work_unit_key.startswith(
+                        representation_prefix
+                    ),
+                    func.coalesce(token_stats_subq.c.total_tokens, 0)
+                    >= batch_max_tokens,
+                ]
+                if batch_max_age_minutes > 0:
+                    age_cutoff = datetime.now(timezone.utc) - timedelta(
+                        minutes=batch_max_age_minutes
+                    )
+                    batch_conditions.append(
+                        token_stats_subq.c.oldest_created_at <= age_cutoff
+                    )
+                query = query.where(or_(*batch_conditions))
 
             result = await db.execute(query)
             available_units = result.scalars().all()

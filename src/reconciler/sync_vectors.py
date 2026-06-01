@@ -149,7 +149,9 @@ async def _get_orphan_messages(
         .where(models.MessageEmbedding.id.is_(None))
         .order_by(models.Message.id.asc())
         .limit(batch_size)
-        .with_for_update(skip_locked=True)
+        # Lock only the messages table: Postgres forbids FOR UPDATE on the
+        # nullable side of an outer join (message_embeddings here).
+        .with_for_update(skip_locked=True, of=models.Message)
     )
 
     result = await db.execute(stmt)
