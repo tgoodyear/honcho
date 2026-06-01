@@ -1,0 +1,131 @@
+<#
+.SYNOPSIS
+    Refreshes the Azure OpenAI AD token used by Honcho containers.
+
+.DESCRIPTION
+    Acquires a fresh Entra ID token for cognitiveservices.azure.com,
+    updates ~/honcho/.env, and force-recreates the api and deriver
+    containers so they pick up the new token.
+
+    Designed to run as a Windows Scheduled Task every 45 minutes.
+    The token expires after ~1 hour; 45-min cadence provides margin.
+
+.NOTES
+    Log file: ~/honcho/token-refresh.log
+    Task name: HonchoTokenRefresh
+#>
+
+[CmdletBinding()]
+param(
+    [switch]$SkipContainerRestart
+)
+
+$ErrorActionPreference = 'Stop'
+
+$honchoDir = Join-Path $env:USERPROFILE 'honcho'
+$envPath   = Join-Path $honchoDir '.env'
+$logPath   = Join-Path $honchoDir 'token-refresh.log'
+
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO')
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $entry = "[$ts] [$Level] $Message"
+    Add-Content -Path $logPath -Value $entry -Encoding UTF8
+    if ($Level -eq 'ERROR') { Write-Error $Message }
+    else { Write-Host $entry }
+}
+
+# Trim log to last 200 lines to prevent unbounded growth
+if (Test-Path $logPath) {
+    $lines = Get-Content $logPath -Tail 200 -ErrorAction SilentlyContinue
+    if ($lines) { Set-Content $logPath -Value $lines -Encoding UTF8 }
+}
+
+Write-Log '--- Token refresh started ---'
+
+# 1. Validate prerequisites
+if (-not (Test-Path $envPath)) {
+    Write-Log ".env not found at $envPath" 'ERROR'
+    exit 1
+}
+
+$azPath = Get-Command az -ErrorAction SilentlyContinue
+if (-not $azPath) {
+    Write-Log 'az CLI not found in PATH' 'ERROR'
+    exit 1
+}
+
+# 2. Acquire fresh token (must use MSIT/commercial cloud for ave-foundry)
+Write-Log 'Acquiring token from az CLI (MSIT tenant)...'
+try {
+    # Save current cloud, switch to AzureCloud for MSIT token
+    $currentCloud = (az cloud show --query name -o tsv 2>$null) ?? 'AzureCloud'
+    if ($currentCloud -ne 'AzureCloud') {
+        Write-Log "Switching from $currentCloud to AzureCloud for token acquisition"
+        az cloud set --name AzureCloud 2>$null
+    }
+
+    $freshToken = az account get-access-token `
+        --resource "https://cognitiveservices.azure.com" `
+        --tenant "72f988bf-86f1-41af-91ab-2d7cd011db47" `
+        --query accessToken -o tsv 2>&1
+
+    # Restore original cloud if we switched
+    if ($currentCloud -ne 'AzureCloud') {
+        Write-Log "Restoring cloud to $currentCloud"
+        az cloud set --name $currentCloud 2>$null
+    }
+
+    if ($LASTEXITCODE -ne 0 -or -not $freshToken -or $freshToken -match 'ERROR') {
+        Write-Log "az CLI returned error: $freshToken" 'ERROR'
+        exit 1
+    }
+
+    # Basic JWT sanity check (should start with eyJ)
+    if ($freshToken -notmatch '^eyJ') {
+        Write-Log "Token does not look like a JWT: $($freshToken.Substring(0,20))..." 'ERROR'
+        exit 1
+    }
+
+    Write-Log "Token acquired (${($freshToken.Length)} chars, starts with $($freshToken.Substring(0,10))...)"
+} catch {
+    Write-Log "Failed to acquire token: $_" 'ERROR'
+    exit 1
+}
+
+# 3. Update .env file
+Write-Log 'Updating .env...'
+try {
+    $envContent = Get-Content $envPath -Raw
+    if ($envContent -match 'AZURE_OPENAI_AD_TOKEN=') {
+        $envContent = $envContent -replace 'AZURE_OPENAI_AD_TOKEN=.*', "AZURE_OPENAI_AD_TOKEN=$freshToken"
+    } else {
+        $envContent += "`nAZURE_OPENAI_AD_TOKEN=$freshToken`n"
+    }
+    [System.IO.File]::WriteAllText($envPath, $envContent, [System.Text.UTF8Encoding]::new($false))
+    Write-Log '.env updated successfully'
+} catch {
+    Write-Log "Failed to update .env: $_" 'ERROR'
+    exit 1
+}
+
+# 4. Force-recreate api and deriver containers
+if (-not $SkipContainerRestart) {
+    Write-Log 'Force-recreating api and deriver containers...'
+    try {
+        Push-Location $honchoDir
+        $output = podman compose up -d --force-recreate api deriver 2>&1
+        Pop-Location
+
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "podman compose failed (exit $LASTEXITCODE): $output" 'WARN'
+        } else {
+            Write-Log 'Containers recreated successfully'
+        }
+    } catch {
+        Pop-Location -ErrorAction SilentlyContinue
+        Write-Log "Container restart failed: $_" 'WARN'
+    }
+}
+
+Write-Log '--- Token refresh completed ---'

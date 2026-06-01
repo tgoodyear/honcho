@@ -43,6 +43,11 @@ RECONCILER_TASKS: dict[str, ReconcilerTask] = {
         work_unit_key="reconciler:sync_vectors",
         interval_seconds=settings.VECTOR_STORE.RECONCILIATION_INTERVAL_SECONDS,
     ),
+    "backfill_orphans": ReconcilerTask(
+        name="backfill_orphans",
+        work_unit_key="reconciler:backfill_orphans",
+        interval_seconds=settings.VECTOR_STORE.RECONCILIATION_INTERVAL_SECONDS,
+    ),
     "cleanup_queue": ReconcilerTask(
         name="cleanup_queue",
         work_unit_key="reconciler:cleanup_queue",

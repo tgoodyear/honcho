@@ -12,7 +12,10 @@ from src.dreamer import process_dream
 from src.exceptions import ResourceNotFoundException, ValidationException
 from src.models import Message
 from src.reconciler.queue_cleanup import cleanup_queue_items
-from src.reconciler.sync_vectors import run_vector_reconciliation_cycle
+from src.reconciler.sync_vectors import (
+    backfill_orphan_message_embeddings,
+    run_vector_reconciliation_cycle,
+)
 from src.schemas import ReconcilerType, ResolvedConfiguration
 from src.telemetry.events import (
     CleanupStaleItemsCompletedEvent,
@@ -337,6 +340,8 @@ async def process_reconciler(payload: ReconcilerPayload) -> None:
     Currently supports:
     - sync_vectors: Syncs pending documents/message embeddings to vector store
       and cleans up soft-deleted documents.
+    - backfill_orphans: Detects messages missing MessageEmbedding rows and
+      backfills them directly in pgvector.
     - cleanup_queue: Removes old processed queue items.
 
     Args:
@@ -377,6 +382,19 @@ async def process_reconciler(payload: ReconcilerPayload) -> None:
                 )
             )
 
+    elif reconciler_type == ReconcilerType.BACKFILL_ORPHANS:
+        logger.debug("Processing backfill_orphans task")
+        orphan_count, fixed_count, failed_count = (
+            await backfill_orphan_message_embeddings()
+        )
+
+        if orphan_count > 0 or failed_count > 0:
+            logger.info(
+                "Orphan message backfill complete: found %s, fixed %s, failed %s",
+                orphan_count,
+                fixed_count,
+                failed_count,
+            )
     elif reconciler_type == ReconcilerType.CLEANUP_QUEUE:
         logger.debug("Processing cleanup_queue task")
         deleted_count = await cleanup_queue_items()

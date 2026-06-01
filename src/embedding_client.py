@@ -177,20 +177,30 @@ class _EmbeddingClient:
             if not config.api_version:
                 raise ValueError("Azure OpenAI api_version is required")
             if config.use_entra_id:
-                from azure.identity import (
-                    DefaultAzureCredential,
-                    get_bearer_token_provider,
-                )
+                import os
 
-                credential = DefaultAzureCredential()
-                token_provider = get_bearer_token_provider(
-                    credential, "https://cognitiveservices.azure.com/.default"
-                )
-                self.client = AsyncAzureOpenAI(
-                    azure_ad_token_provider=token_provider,
-                    azure_endpoint=config.base_url,
-                    api_version=config.api_version,
-                )
+                ad_token = os.environ.get("AZURE_OPENAI_AD_TOKEN")
+                if ad_token:
+                    self.client = AsyncAzureOpenAI(
+                        azure_ad_token=ad_token,
+                        azure_endpoint=config.base_url,
+                        api_version=config.api_version,
+                    )
+                else:
+                    from azure.identity import (
+                        DefaultAzureCredential,
+                        get_bearer_token_provider,
+                    )
+
+                    credential = DefaultAzureCredential()
+                    token_provider = get_bearer_token_provider(
+                        credential, "https://cognitiveservices.azure.com/.default"
+                    )
+                    self.client = AsyncAzureOpenAI(
+                        azure_ad_token_provider=token_provider,
+                        azure_endpoint=config.base_url,
+                        api_version=config.api_version,
+                    )
             else:
                 self.client = AsyncAzureOpenAI(
                     api_key=config.api_key,

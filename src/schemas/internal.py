@@ -17,6 +17,7 @@ class ReconcilerType(str, Enum):
     """Types of reconciler tasks that can be performed."""
 
     SYNC_VECTORS = "sync_vectors"
+    BACKFILL_ORPHANS = "backfill_orphans"
     CLEANUP_QUEUE = "cleanup_queue"
 
 

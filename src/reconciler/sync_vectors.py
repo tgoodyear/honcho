@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Constants
 RECONCILIATION_BATCH_SIZE = 50
+ORPHAN_BACKFILL_BATCH_SIZE = 100
 RECONCILIATION_TIME_BUDGET_SECONDS = 240  # Leave headroom for other maintenance work
 MAX_SYNC_ATTEMPTS = 20  # After this many failures, mark as failed
 # Flat wait between sync attempts. With MAX_SYNC_ATTEMPTS=20 this gives ~3 hours
@@ -126,6 +127,27 @@ async def _get_message_embeddings_needing_sync(
             )
         )
         .order_by(models.MessageEmbedding.last_sync_at.asc().nullsfirst())
+        .limit(batch_size)
+        .with_for_update(skip_locked=True)
+    )
+
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def _get_orphan_messages(
+    db: AsyncSession,
+    batch_size: int = ORPHAN_BACKFILL_BATCH_SIZE,
+) -> list[models.Message]:
+    """Get messages that have no corresponding message_embeddings rows."""
+    stmt = (
+        select(models.Message)
+        .outerjoin(
+            models.MessageEmbedding,
+            models.Message.public_id == models.MessageEmbedding.message_id,
+        )
+        .where(models.MessageEmbedding.id.is_(None))
+        .order_by(models.Message.id.asc())
         .limit(batch_size)
         .with_for_update(skip_locked=True)
     )
@@ -530,6 +552,79 @@ async def _reconcile_message_embeddings_batch(
         metrics.message_embeddings_failed += failed
         await db.commit()
         return True
+
+
+async def backfill_orphan_message_embeddings() -> tuple[int, int, int]:
+    """
+    Backfill message embeddings for orphan messages missing MessageEmbedding rows.
+
+    Returns a tuple of (orphans_found, fixed_count, failed_count).
+    """
+    if not settings.EMBED_MESSAGES:
+        logger.debug("Message embedding disabled; skipping orphan backfill")
+        return 0, 0, 0
+
+    async with tracked_db("reconciliation_orphan_backfill") as db:
+        orphan_messages = await _get_orphan_messages(db)
+        orphan_count = len(orphan_messages)
+        fixed_count = 0
+        failed_count = 0
+
+        if not orphan_messages:
+            logger.debug("No orphan messages found for embedding backfill")
+            return 0, 0, 0
+
+        logger.info(
+            "Found %s orphan messages without embeddings; attempting backfill",
+            orphan_count,
+        )
+
+        for message in orphan_messages:
+            try:
+                existing_embedding = await db.scalar(
+                    select(models.MessageEmbedding.id)
+                    .where(models.MessageEmbedding.message_id == message.public_id)
+                    .limit(1)
+                )
+                if existing_embedding is not None:
+                    logger.debug(
+                        "Skipping orphan backfill for message %s; embedding already exists",
+                        message.public_id,
+                    )
+                    continue
+
+                embedding = await embedding_client.embed(message.content)
+                db.add(
+                    models.MessageEmbedding(
+                        content=message.content,
+                        message_id=message.public_id,
+                        workspace_name=message.workspace_name,
+                        session_name=message.session_name,
+                        peer_name=message.peer_name,
+                        sync_state="synced",
+                        last_sync_at=datetime.datetime.now(datetime.timezone.utc),
+                        sync_attempts=0,
+                        embedding=embedding,
+                    )
+                )
+                await db.commit()
+                fixed_count += 1
+            except Exception:
+                await db.rollback()
+                failed_count += 1
+                logger.exception(
+                    "Failed to backfill orphan message embedding for message %s in workspace %s",
+                    message.public_id,
+                    message.workspace_name,
+                )
+
+        logger.info(
+            "Orphan message backfill complete: found %s, fixed %s, failed %s",
+            orphan_count,
+            fixed_count,
+            failed_count,
+        )
+        return orphan_count, fixed_count, failed_count
 
 
 async def _cleanup_documents_batch(

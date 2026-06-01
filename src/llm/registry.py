@@ -99,6 +99,17 @@ def get_azure_openai_override_client(
             "azure_openai transport requires overrides.api_version"
         )
     if use_entra_id:
+        import os
+
+        # Allow pre-generated token via env var (useful in containers without az CLI)
+        ad_token = os.environ.get("AZURE_OPENAI_AD_TOKEN")
+        if ad_token:
+            return AsyncAzureOpenAI(
+                azure_ad_token=ad_token,
+                azure_endpoint=azure_endpoint,
+                api_version=api_version,
+            )
+
         from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
         credential = DefaultAzureCredential()
