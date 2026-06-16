@@ -193,3 +193,6 @@ metrics.jsonl
 AGENTS.md
 lancedb_data/
 grafana-data/
+
+# local upgrade backups (large pg_dump, rollback notes) - do not commit
+.upgrade-backup/
