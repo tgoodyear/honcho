@@ -269,15 +269,47 @@ export function register(server: McpServer, ctx: ToolContext) {
     {
       description: [
         "Add messages to a session from specific peers.",
-        "Use this to record conversation turns. Each message must specify the peer_id of the author.",
-        "Each message must specify the peer_id of the author.",
+        "Use this to record conversation turns and durable notes.",
+        "",
+        "Exact call shape — both identifiers matter:",
+        '  { "session_id": "<session>", "messages": [ { "peer_id": "<author>", "content": "<text>" } ] }',
+        "",
+        "session_id is TOP-LEVEL, not inside a message.",
+        "peer_id is PER-MESSAGE and names the author (an agent or person), not a role.",
+        "Do not send {role, content} — that is a chat-completions shape and will not attribute correctly.",
+        "peer_name and peer are accepted as aliases for peer_id.",
+        "If session_id or peer_id is missing the message is still stored, filed under a fallback and",
+        "tagged with metadata session_id_inferred / peer_id_inferred so the gap stays auditable.",
+        "Always supply both explicitly when you know them — inferred attribution is lossy.",
       ].join("\n"),
       inputSchema: {
-        session_id: z.string().describe("The session to add messages to."),
+        session_id: z
+          .string()
+          .optional()
+          .describe(
+            "The session to add messages to. Top-level, not per-message. Supply this whenever known; " +
+              "if omitted it falls back to HONCHO_DEFAULT_SESSION_ID or 'agent-memory' and the messages " +
+              "are tagged session_id_inferred.",
+          ),
         messages: z
           .array(
             z.object({
-              peer_id: z.string().describe("Peer ID authoring this message."),
+              peer_id: z
+                .string()
+                .optional()
+                .describe(
+                  "Peer ID authoring this message. Supply this whenever known; if omitted it falls back " +
+                    "to HONCHO_DEFAULT_PEER_ID or the configured assistant name and the message is " +
+                    "tagged peer_id_inferred.",
+                ),
+              peer_name: z
+                .string()
+                .optional()
+                .describe("Alias for peer_id. Used only when peer_id is absent."),
+              peer: z
+                .string()
+                .optional()
+                .describe("Alias for peer_id. Used only when peer_id and peer_name are absent."),
               content: z.string().describe("Message text."),
               metadata: z
                 .record(z.string(), z.unknown())
@@ -290,23 +322,69 @@ export function register(server: McpServer, ctx: ToolContext) {
     },
     async ({ session_id, messages }) => {
       try {
-        const session = await ctx.honcho.session(session_id);
+        // First non-blank value wins; trims and treats "" / whitespace as absent.
+        const pick = (...vals: (string | undefined)[]): string | undefined =>
+          vals.find((v) => typeof v === "string" && v.trim().length > 0)?.trim();
+
+        // Read env without referencing `process` directly, so this stays safe
+        // under both the local stdio runtime and the Workers bundle.
+        const envDefault = (key: string): string | undefined =>
+          (globalThis as { process?: { env?: Record<string, string | undefined> } })
+            .process?.env?.[key];
+
+        const explicitSessionId = pick(session_id);
+        const resolvedSessionId =
+          explicitSessionId ??
+          pick(envDefault("HONCHO_DEFAULT_SESSION_ID")) ??
+          "agent-memory";
+        const sessionInferred = explicitSessionId === undefined;
+
+        const session = await ctx.honcho.session(resolvedSessionId);
         const peerCache = new Map<string, Awaited<ReturnType<typeof ctx.honcho.peer>>>();
         const sessionMessages = [];
+        let inferredPeerCount = 0;
+
         for (const msg of messages) {
-          let peer = peerCache.get(msg.peer_id);
+          const explicitPeerId = pick(msg.peer_id, msg.peer_name, msg.peer);
+          const peerId =
+            explicitPeerId ??
+            pick(envDefault("HONCHO_DEFAULT_PEER_ID")) ??
+            ctx.config.assistantName;
+          if (explicitPeerId === undefined) inferredPeerCount++;
+
+          let peer = peerCache.get(peerId);
           if (!peer) {
-            peer = await ctx.honcho.peer(msg.peer_id);
-            peerCache.set(msg.peer_id, peer);
+            peer = await ctx.honcho.peer(peerId);
+            peerCache.set(peerId, peer);
           }
+
+          // Record inferred attribution so a guessed author is visible, never silent.
+          const provenance: Record<string, unknown> = {};
+          if (explicitPeerId === undefined) provenance.peer_id_inferred = true;
+          if (sessionInferred) provenance.session_id_inferred = true;
+
+          const metadata =
+            msg.metadata || Object.keys(provenance).length > 0
+              ? { ...(msg.metadata ?? {}), ...provenance }
+              : undefined;
+
           sessionMessages.push(
-            msg.metadata
-              ? peer.message(msg.content, { metadata: msg.metadata })
+            metadata
+              ? peer.message(msg.content, { metadata })
               : peer.message(msg.content),
           );
         }
+
         await session.addMessages(sessionMessages);
-        return textResult("Messages added to session successfully");
+        return textResult({
+          status: "Messages added to session successfully",
+          session_id: resolvedSessionId,
+          message_count: sessionMessages.length,
+          ...(sessionInferred ? { session_id_inferred: true } : {}),
+          ...(inferredPeerCount > 0
+            ? { peer_id_inferred_count: inferredPeerCount }
+            : {}),
+        });
       } catch (e) {
         return errorResult(
           `Failed to add messages: ${e instanceof Error ? e.message : String(e)}`,
