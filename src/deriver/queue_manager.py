@@ -31,6 +31,7 @@ from src.deriver.consumer import (
 )
 from src.dreamer.dream_scheduler import (
     DreamScheduler,
+    check_and_schedule_dream,
     get_dream_scheduler,
     set_dream_scheduler,
 )
@@ -219,6 +220,7 @@ class QueueManager:
         logger.debug("Starting polling loop directly")
         try:
             await self._sleep_startup_jitter()
+            await self._rearm_pending_dreams()
             await self.polling_loop()
         finally:
             await self.cleanup()
@@ -479,6 +481,105 @@ class QueueManager:
         # an early return means shutdown fired and polling_loop will exit at once.
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self.shutdown_event.wait(), timeout=delay)
+
+    async def _rearm_pending_dreams(self) -> None:
+        """Restore in-memory dream idle timers that did not survive a restart.
+
+        DreamScheduler holds pending timers in a process-local
+        ``dict[str, asyncio.Task]``; a restart drops every armed timer.
+        The eligibility gate ``check_and_schedule_dream()`` is invoked only
+        from the message-write path, so an already-idle collection whose
+        timer was lost has no path to acquire a new one until fresh activity
+        arrives — which for a genuinely idle observer/observed pair is
+        never. This pass closes that gap by re-running the existing gate
+        once at startup against every collection, letting the gate arm a
+        timer wherever a dream is due.
+
+        The pass deliberately does not pre-filter on prior dream metadata.
+        A collection that has crossed ``DOCUMENT_THRESHOLD`` explicit
+        observations but has never been dream-evaluated (``last_dream_at``
+        is None, ``last_dream_document_count`` defaults to 0) is *the*
+        canonical dormant case this restore exists to unblock — excluding
+        it would reintroduce the deadlock at the never-dreamed population.
+        The gate itself performs one indexed COUNT per collection, so the
+        wider sweep is O(n) indexed reads at boot rather than a scan.
+
+        Design notes:
+          * The gate is reused unmodified so its rate limits
+            (DOCUMENT_THRESHOLD, MIN_HOURS_BETWEEN_DREAMS, and the
+            uq_queue_dream_pending_work_unit_key in-flight check) stay the
+            single source of truth for whether a dream should fire.
+          * A small stagger is inserted between successful arms so timers
+            armed together don't fire in lockstep at
+            ``now + IDLE_TIMEOUT_MINUTES``. The queue and worker semaphore
+            would still serialize execution, but jittering the schedule
+            points also spreads the eventual model calls.
+          * Any failure — whole-pass or per-collection — is logged and
+            swallowed. Restore-on-boot must never prevent the deriver from
+            starting.
+        """
+        if not settings.DREAM.ENABLED:
+            return
+
+        try:
+            async with tracked_db("dream_startup_rearm") as db:
+                # No pre-filter: evaluate every collection and let the gate
+                # decide. Filtering on prior dream metadata here would
+                # silently skip the never-dreamed population, which is
+                # precisely the dormant case this pass needs to catch.
+                stmt = select(models.Collection)
+                result = await db.execute(stmt)
+                collections = list(result.scalars().all())
+
+                if not collections:
+                    logger.info(
+                        "Dream re-arm: no collections found; nothing to restore"
+                    )
+                    return
+
+                logger.info(
+                    "Dream re-arm: evaluating %d collection(s) for idle-timer restore",
+                    len(collections),
+                )
+
+                armed = 0
+                skipped = 0
+                errors = 0
+
+                for collection in collections:
+                    try:
+                        scheduled = await check_and_schedule_dream(db, collection)
+                    except Exception:
+                        errors += 1
+                        logger.warning(
+                            "Dream re-arm: gate raised for %s/%s/%s; continuing",
+                            collection.workspace_name,
+                            collection.observer,
+                            collection.observed,
+                            exc_info=True,
+                        )
+                        continue
+
+                    if scheduled:
+                        armed += 1
+                        # Sub-second stagger between arms; over N eligible
+                        # collections this spreads later firings by up to
+                        # ~N * 2s. Scheduling jitter, not security/crypto.
+                        await asyncio.sleep(random.uniform(0.0, 2.0))  # nosec B311
+                    else:
+                        skipped += 1
+
+                logger.info(
+                    "Dream re-arm complete: evaluated=%d armed=%d skipped=%d errors=%d",
+                    len(collections),
+                    armed,
+                    skipped,
+                    errors,
+                )
+        except Exception:
+            logger.exception(
+                "Dream re-arm pass failed; continuing deriver startup without restore"
+            )
 
     def _advance_poll_interval(self) -> float:
         """Return the current idle/backoff sleep, then grow it toward the cap."""

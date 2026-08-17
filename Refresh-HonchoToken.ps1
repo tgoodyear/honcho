@@ -86,11 +86,32 @@ function Get-EnvToken {
     return $null
 }
 
-# Trim log to last 200 lines to prevent unbounded growth
-if (Test-Path $logPath) {
-    $lines = Get-Content $logPath -Tail 200 -ErrorAction SilentlyContinue
-    if ($lines) { Set-Content $logPath -Value $lines -Encoding UTF8 }
+# Read the token the RUNNING container actually holds. Podman bakes env at container
+# CREATE time, so a plain restart (reboot, `podman start`, the Start-Podman task) leaves
+# a stale token baked in while .env looks perfectly current. Without this probe the
+# script no-ops forever and Honcho's embedding calls 401 silently.
+function Get-ContainerToken {
+    param([string]$Container = 'honcho-api-1')
+    try {
+        $t = podman exec $Container printenv AZURE_OPENAI_AD_TOKEN 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $t) { return $null }
+        return ($t | Select-Object -First 1).Trim()
+    } catch { return $null }
 }
+
+# Trim log to last 200 lines to prevent unbounded growth
+# Wrapped defensively: this runs before the mutex is acquired below, so a run
+# that overlaps a still-writing prior instance can hit a transient file-sharing
+# violation here. With $ErrorActionPreference = 'Stop' that would otherwise be
+# a terminating error before this run ever reaches Write-Log or the mutex -
+# exactly the kind of unattributable, log-free failure this script must never
+# produce.
+try {
+    if (Test-Path $logPath) {
+        $lines = Get-Content $logPath -Tail 200 -ErrorAction SilentlyContinue
+        if ($lines) { Set-Content $logPath -Value $lines -Encoding UTF8 }
+    }
+} catch {}
 
 # Single-instance lock so the scheduled task and a manual run can't collide.
 $mutex = New-Object System.Threading.Mutex($false, 'Global\HonchoTokenRefresh')
@@ -116,12 +137,45 @@ try {
         exit 1
     }
 
-    # 2. Inspect the token currently in .env (proxy for what the containers run with;
-    #    valid because this script is the sole writer and we always restart when we write).
+    # On Windows `az` is az.cmd, a batch wrapper. Every invocation spawns a cmd.exe
+    # child, which paints a console window in the interactive session even though the
+    # task launches us under conhost --headless (that only covers this process, not
+    # grandchildren). az.cmd does nothing but exec "%~dp0\..\python.exe" -IBm azure.cli,
+    # so call that directly and skip the batch layer. Falls back to az.cmd if absent.
+    $azPy = Join-Path (Split-Path (Split-Path $azPath.Source -Parent) -Parent) 'python.exe'
+    if (Test-Path $azPy) {
+        $azExe = $azPy
+        $azPre = @('-IBm', 'azure.cli')
+    } else {
+        $azExe = $azPath.Source
+        $azPre = @()
+    }
+
+    # 2. Inspect the token currently in .env AND the one baked into the running container.
+    #    These diverge whenever something other than this script restarts the containers
+    #    (machine reboot, `podman start`, the Start-Podman-and-Honcho task): podman bakes
+    #    env at CREATE time, so the container keeps a stale token while .env is current.
     $currentToken = Get-EnvToken -Path $envPath
     $currentExp   = Get-JwtExp -Token $currentToken
     $now          = [DateTime]::UtcNow
     $currentTtlMin = if ($currentExp) { [int]($currentExp - $now).TotalMinutes } else { -1 }
+
+    $containerToken  = Get-ContainerToken
+    $containerExp    = Get-JwtExp -Token $containerToken
+    $containerTtlMin = if ($containerExp) { [int]($containerExp - $now).TotalMinutes } else { -1 }
+
+    # Container is stale if we couldn't read it, it's already expired, or it's older
+    # than what .env holds. Any of these means a recreate is required regardless of
+    # how healthy .env looks.
+    $containerStale = $false
+    if ($containerToken) {
+        if (-not $containerExp -or $containerExp -lt $now -or ($currentExp -and $containerExp -lt $currentExp)) {
+            $containerStale = $true
+        }
+        Write-Log "Container token exp: $(if ($containerExp) { $containerExp.ToString('s') + 'Z' } else { '<unparseable>' }) (${containerTtlMin} min left)$(if ($containerStale) { ' [STALE - recreate required]' })"
+    } else {
+        Write-Log 'Could not read token from running container (not running?); relying on .env only.' 'WARN'
+    }
 
     if (-not $Force -and $currentExp -and $currentTtlMin -gt $NoOpIfCurrentTtlAbove) {
         # .env token still has meaningful life. Peek at az to see if MSAL has minted a
@@ -134,20 +188,20 @@ try {
     Write-Log "Current .env token exp: $(if ($currentExp) { $currentExp.ToString('s') + 'Z' } else { '<none>' }) (${currentTtlMin} min left)"
     Write-Log 'Acquiring token from az CLI (MSIT tenant)...'
     try {
-        $currentCloud = (az cloud show --query name -o tsv 2>$null) ?? 'AzureCloud'
+        $currentCloud = (& $azExe @azPre cloud show --query name -o tsv 2>$null) ?? 'AzureCloud'
         if ($currentCloud -ne 'AzureCloud') {
             Write-Log "Switching from $currentCloud to AzureCloud for token acquisition"
-            az cloud set --name AzureCloud 2>$null | Out-Null
+            & $azExe @azPre cloud set --name AzureCloud 2>$null | Out-Null
         }
 
-        $freshToken = az account get-access-token `
+        $freshToken = & $azExe @azPre account get-access-token `
             --resource "https://cognitiveservices.azure.com" `
             --tenant "72f988bf-86f1-41af-91ab-2d7cd011db47" `
             --query accessToken -o tsv 2>&1
 
         if ($currentCloud -ne 'AzureCloud') {
             Write-Log "Restoring cloud to $currentCloud"
-            az cloud set --name $currentCloud 2>$null | Out-Null
+            & $azExe @azPre cloud set --name $currentCloud 2>$null | Out-Null
         }
 
         if ($LASTEXITCODE -ne 0 -or -not $freshToken -or $freshToken -match 'ERROR') {
@@ -170,7 +224,7 @@ try {
 
     # 4. Idempotency: if the .env already has this exact token (same exp) and
     #    there's still life in it, do nothing.
-    if (-not $Force) {
+    if (-not $Force -and -not $containerStale) {
         if ($currentToken -and $freshToken -eq $currentToken) {
             Write-Log "No-op: .env already has this token (${currentTtlMin} min left)."
             Write-Log '--- Token refresh completed (no-op) ---'
@@ -184,8 +238,10 @@ try {
     }
 
     # 5. Refuse to install a near-expired token — that would just create churn
-    #    without solving the problem.
-    if ($freshTtlMin -ge 0 -and $freshTtlMin -lt $MinTtlMinutesToRestart) {
+    #    without solving the problem. EXCEPTION: if the container is holding an
+    #    already-expired token, even a short-lived fresh one is strictly better than
+    #    leaving Honcho's embeddings 401-ing until the next tick.
+    if ($freshTtlMin -ge 0 -and $freshTtlMin -lt $MinTtlMinutesToRestart -and -not $containerStale) {
         Write-Log "Fresh token has only ${freshTtlMin} min left (< ${MinTtlMinutesToRestart}). Skipping update; will retry next tick." 'WARN'
         Write-Log '--- Token refresh completed (skipped) ---'
         exit 0
