@@ -27,12 +27,29 @@
     Log file: ~/honcho/token-refresh.log
     Task name: HonchoTokenRefresh
     Lock:     mutex Global\HonchoTokenRefresh (prevents concurrent runs)
+
+    CREDENTIAL COMPARTMENT
+    This script never reads the shared default az profile (~/.Azure). It pins
+    AZURE_CONFIG_DIR to -AzureConfigDir (default ~/.azure-msit) so interactive
+    work in other tenants (studemo, gov) cannot take Honcho down. Sibling
+    compartments already in use: .azure-studemo, .azure-gov, .azure-devops.
+
+    To (re)authenticate this compartment:
+        $env:AZURE_CONFIG_DIR = "$env:USERPROFILE\.azure-msit"
+        az login --tenant 72f988bf-86f1-41af-91ab-2d7cd011db47
+    AZURE_CONFIG_DIR must be set in the SAME process as the az call.
 #>
 
 [CmdletBinding()]
 param(
     [switch]$SkipContainerRestart,
-    [switch]$Force  # bypass idempotency check; always update + restart
+    [switch]$Force,  # bypass idempotency check; always update + restart
+
+    # Dedicated az CLI credential compartment. Honcho MUST NOT read the shared
+    # default profile (~/.Azure): any interactive `az login` or `az account set`
+    # to another tenant silently repoints it, every refresh then fails
+    # AADSTS50020, and semantic search 500s until a human notices.
+    [string]$AzureConfigDir = (Join-Path $env:USERPROFILE '.azure-msit')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -151,6 +168,19 @@ try {
         $azPre = @()
     }
 
+    # 1b. Pin az to Honcho's own credential compartment before any az call.
+    #     Reading the shared default profile is what took search down on
+    #     2026-08-19: a studemo `az login` repointed ~/.Azure and refresh failed
+    #     AADSTS50020 every 5 min for 3.5h. Isolation makes that impossible.
+    if (-not (Test-Path $AzureConfigDir)) {
+        Write-Log "az credential compartment not found: $AzureConfigDir" 'ERROR'
+        Write-Log "Create it with:  `$env:AZURE_CONFIG_DIR='$AzureConfigDir'; az login --tenant 72f988bf-86f1-41af-91ab-2d7cd011db47" 'ERROR'
+        exit 1
+    }
+    $env:AZURE_CONFIG_DIR = $AzureConfigDir
+    $azIdentity = (& $azExe @azPre account show --query 'user.name' -o tsv 2>$null)
+    Write-Log "az compartment: $AzureConfigDir (identity: $(if ($azIdentity) { $azIdentity } else { '<none>' }))"
+
     # 2. Inspect the token currently in .env AND the one baked into the running container.
     #    These diverge whenever something other than this script restarts the containers
     #    (machine reboot, `podman start`, the Start-Podman-and-Honcho task): podman bakes
@@ -206,6 +236,9 @@ try {
 
         if ($LASTEXITCODE -ne 0 -or -not $freshToken -or $freshToken -match 'ERROR') {
             Write-Log "az CLI returned error: $freshToken" 'ERROR'
+            if ("$freshToken" -match 'AADSTS50020') {
+                Write-Log "Compartment $AzureConfigDir holds a non-MSIT identity. Re-auth it with:  `$env:AZURE_CONFIG_DIR='$AzureConfigDir'; az login --tenant 72f988bf-86f1-41af-91ab-2d7cd011db47" 'ERROR'
+            }
             exit 1
         }
 
