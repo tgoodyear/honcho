@@ -6,8 +6,8 @@ api/docker-compose.yml
 *.db
 data
 redis-data
-docker-compose.yml
-compose.yml
+/docker-compose.yml
+/compose.yml
 
 
 
@@ -196,3 +196,6 @@ grafana-data/
 
 # local upgrade backups (large pg_dump, rollback notes) - do not commit
 .upgrade-backup/
+
+# Claude Code addon stuff
+.omc
