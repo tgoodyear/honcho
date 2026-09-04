@@ -1,0 +1,60 @@
+# AVE deployment overlay. The current local docker-compose.yml already carries
+# these values; Compose merges same-key settings so this file also works until
+# that local file is refreshed from docker-compose.yml.example.
+
+services:
+  api:
+    container_name: honcho-api-1
+    volumes:
+      - type: bind
+        source: ${USERPROFILE}/.azure
+        target: /home/app/.azure
+        read_only: true
+    environment:
+      - AZURE_CONFIG_DIR=/home/app/.azure
+      - EMBEDDING_MODEL_CONFIG__TIMEOUT=30
+    dns:
+      - 8.8.8.8
+    extra_hosts:
+      - "database:10.89.10.10"
+      - "redis:10.89.10.11"
+    networks:
+      default:
+        ipv4_address: 10.89.10.12
+
+  deriver:
+    container_name: honcho-deriver-1
+    volumes:
+      - type: bind
+        source: ${USERPROFILE}/.azure
+        target: /home/app/.azure
+        read_only: true
+    environment:
+      - AZURE_CONFIG_DIR=/home/app/.azure
+      - EMBEDDING_MODEL_CONFIG__TIMEOUT=30
+      - DERIVER_MODEL_CONFIG__OVERRIDES__PROVIDER_PARAMS__TIMEOUT=60
+    dns:
+      - 8.8.8.8
+    extra_hosts:
+      - "database:10.89.10.10"
+      - "redis:10.89.10.11"
+    networks:
+      default:
+        ipv4_address: 10.89.10.13
+
+  database:
+    container_name: honcho-database-1
+    networks:
+      default:
+        ipv4_address: 10.89.10.10
+
+  redis:
+    container_name: honcho-redis-1
+    networks:
+      default:
+        ipv4_address: 10.89.10.11
+
+networks:
+  default:
+    name: honcho_default
+    external: true

@@ -845,10 +845,12 @@ async def test_azure_openai_embedding_client_uses_azure_endpoint_and_version(
             api_key: str | None,
             azure_endpoint: str | None,
             api_version: str | None,
+            timeout: float | None = None,
         ) -> None:
             captured["api_key"] = api_key
             captured["azure_endpoint"] = azure_endpoint
             captured["api_version"] = api_version
+            captured["timeout"] = timeout
             self.embeddings: FakeOpenAIEmbeddingsAPI = fake_embeddings
 
     monkeypatch.setattr("src.embedding_client.AsyncAzureOpenAI", FakeAzureClient)
@@ -860,6 +862,7 @@ async def test_azure_openai_embedding_client_uses_azure_endpoint_and_version(
             api_key="az-test-key",
             base_url="https://gateway.example/azure-openai",
             api_version="2024-10-21",
+            timeout=30,
         ),
         vector_dimensions=8,
         max_input_tokens=8192,
@@ -873,6 +876,7 @@ async def test_azure_openai_embedding_client_uses_azure_endpoint_and_version(
         "api_key": "az-test-key",
         "azure_endpoint": "https://gateway.example/azure-openai",
         "api_version": "2024-10-21",
+        "timeout": 30,
     }
     assert fake_embeddings.calls == [
         {"model": "text-embedding-3-small", "input": ["hello world"]}

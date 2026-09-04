@@ -70,6 +70,10 @@ export function createClient(
     apiKey: config.apiKey,
     baseURL: config.baseUrl,
     workspaceId,
+    // SDK Zod cap is 3 inclusive. Longer recreate windows are handled
+    // by withHonchoRetry in sessions.ts, not by exceeding this cap.
+    maxRetries: 3,
+    timeout: 20000,
   });
 }
 

@@ -10,6 +10,30 @@ import {
   workspaceIdSchema,
 } from "../types.js";
 
+function isRetryableHonchoError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /unable to connect|econnrefused|econnreset|fetch failed|socket hang up|network|502|503|504/i.test(
+    msg,
+  );
+}
+
+async function withHonchoRetry<T>(op: () => Promise<T>): Promise<T> {
+  const delaysMs = [2000, 5000, 8000, 8000, 10000, 15000];
+  let last: unknown;
+  for (let i = 0; i <= delaysMs.length; i++) {
+    try {
+      return await op();
+    } catch (error) {
+      last = error;
+      if (!isRetryableHonchoError(error) || i === delaysMs.length) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delaysMs[i]));
+    }
+  }
+  throw last;
+}
+
 export function register(server: McpServer, ctx: ToolContext) {
   // ── create_session ──────────────────────────────────────────────────
   server.registerTool(
@@ -351,48 +375,58 @@ export function register(server: McpServer, ctx: ToolContext) {
           "agent-memory";
         const sessionInferred = explicitSessionId === undefined;
 
-        const honcho = ctx.clientFor(workspace_id);
-        const session = await honcho.session(resolvedSessionId);
-        const peerCache = new Map<string, Awaited<ReturnType<typeof honcho.peer>>>();
-        const sessionMessages = [];
-        let inferredPeerCount = 0;
+        const { inferredPeerCount, messageCount } = await withHonchoRetry(
+          async () => {
+            const honcho = ctx.clientFor(workspace_id);
+            const session = await honcho.session(resolvedSessionId);
+            const peerCache = new Map<
+              string,
+              Awaited<ReturnType<typeof honcho.peer>>
+            >();
+            const sessionMessages = [];
+            let inferredPeerCount = 0;
 
-        for (const msg of messages) {
-          const explicitPeerId = pick(msg.peer_id, msg.peer_name, msg.peer);
-          const peerId =
-            explicitPeerId ??
-            pick(envDefault("HONCHO_DEFAULT_PEER_ID")) ??
-            ctx.config.assistantName;
-          if (explicitPeerId === undefined) inferredPeerCount++;
+            for (const msg of messages) {
+              const explicitPeerId = pick(msg.peer_id, msg.peer_name, msg.peer);
+              const peerId =
+                explicitPeerId ??
+                pick(envDefault("HONCHO_DEFAULT_PEER_ID")) ??
+                "unattributed";
+              if (explicitPeerId === undefined) inferredPeerCount++;
 
-          let peer = peerCache.get(peerId);
-          if (!peer) {
-            peer = await honcho.peer(peerId);
-            peerCache.set(peerId, peer);
-          }
+              let peer = peerCache.get(peerId);
+              if (!peer) {
+                peer = await honcho.peer(peerId);
+                peerCache.set(peerId, peer);
+              }
 
-          // Record inferred attribution so a guessed author is visible, never silent.
-          const provenance: Record<string, unknown> = {};
-          if (explicitPeerId === undefined) provenance.peer_id_inferred = true;
-          if (sessionInferred) provenance.session_id_inferred = true;
+              const provenance: Record<string, unknown> = {};
+              if (explicitPeerId === undefined) provenance.peer_id_inferred = true;
+              if (sessionInferred) provenance.session_id_inferred = true;
 
-          const metadata =
-            msg.metadata || Object.keys(provenance).length > 0
-              ? { ...(msg.metadata ?? {}), ...provenance }
-              : undefined;
+              const metadata =
+                msg.metadata || Object.keys(provenance).length > 0
+                  ? { ...(msg.metadata ?? {}), ...provenance }
+                  : undefined;
 
-          sessionMessages.push(
-            metadata
-              ? peer.message(msg.content, { metadata })
-              : peer.message(msg.content),
-          );
-        }
+              sessionMessages.push(
+                metadata
+                  ? peer.message(msg.content, { metadata })
+                  : peer.message(msg.content),
+              );
+            }
 
-        await session.addMessages(sessionMessages);
+            await session.addMessages(sessionMessages);
+            return {
+              inferredPeerCount,
+              messageCount: sessionMessages.length,
+            };
+          },
+        );
         return textResult({
           status: "Messages added to session successfully",
           session_id: resolvedSessionId,
-          message_count: sessionMessages.length,
+          message_count: messageCount,
           ...(sessionInferred ? { session_id_inferred: true } : {}),
           ...(inferredPeerCount > 0
             ? { peer_id_inferred_count: inferredPeerCount }

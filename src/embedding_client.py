@@ -231,6 +231,12 @@ class _EmbeddingClient:
                 raise ValueError("Azure OpenAI base_url (azure_endpoint) is required")
             if not config.api_version:
                 raise ValueError("Azure OpenAI api_version is required")
+            client_kwargs: dict[str, Any] = {
+                "azure_endpoint": config.base_url,
+                "api_version": config.api_version,
+            }
+            if config.timeout is not None:
+                client_kwargs["timeout"] = config.timeout
             if config.use_entra_id:
                 import os
 
@@ -238,8 +244,7 @@ class _EmbeddingClient:
                 if ad_token:
                     self.client = AsyncAzureOpenAI(
                         azure_ad_token=ad_token,
-                        azure_endpoint=config.base_url,
-                        api_version=config.api_version,
+                        **client_kwargs,
                     )
                 else:
                     from azure.identity import (
@@ -253,14 +258,12 @@ class _EmbeddingClient:
                     )
                     self.client = AsyncAzureOpenAI(
                         azure_ad_token_provider=token_provider,
-                        azure_endpoint=config.base_url,
-                        api_version=config.api_version,
+                        **client_kwargs,
                     )
             else:
                 self.client = AsyncAzureOpenAI(
                     api_key=config.api_key,
-                    azure_endpoint=config.base_url,
-                    api_version=config.api_version,
+                    **client_kwargs,
                 )
             self.max_embedding_tokens = max_input_tokens
             self.max_batch_size = config.max_batch_size or 2048

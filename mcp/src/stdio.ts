@@ -11,35 +11,50 @@
  * Optional env vars:
  *   HONCHO_API_KEY        — defaults to "local" (self-hosted doesn't need a real key)
  *   HONCHO_WORKSPACE_ID   — defaults to "default"
- *   HONCHO_ASSISTANT_NAME — defaults to "Assistant"
  */
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { createClient } from "./config.js";
+import {
+  createClientFactory,
+  createUnscopedClient,
+} from "./config.js";
 import { createServer } from "./server.js";
 import type { HonchoConfig } from "./config.js";
 
-const baseUrl = process.env.HONCHO_API_URL?.trim();
+const runtimeProcess = (
+  globalThis as {
+    process?: {
+      env?: Record<string, string | undefined>;
+      exit(code: number): never;
+    };
+  }
+).process;
+const env = runtimeProcess?.env;
+
+const baseUrl = env?.HONCHO_API_URL?.trim();
 if (!baseUrl) {
   console.error("ERROR: HONCHO_API_URL env var is required (e.g. http://localhost:8000)");
-  process.exit(1);
+  runtimeProcess?.exit(1);
+  throw new Error("HONCHO_API_URL is required");
 }
 
-const userName = process.env.X_HONCHO_USER_NAME?.trim();
+const userName = env?.X_HONCHO_USER_NAME?.trim();
 if (!userName) {
   console.error("ERROR: X_HONCHO_USER_NAME env var is required");
-  process.exit(1);
+  runtimeProcess?.exit(1);
+  throw new Error("X_HONCHO_USER_NAME is required");
 }
 
 const config: HonchoConfig = {
-  apiKey: process.env.HONCHO_API_KEY?.trim() || "local",
-  userName,
-  assistantName: process.env.HONCHO_ASSISTANT_NAME?.trim() || "Assistant",
+  apiKey: env?.HONCHO_API_KEY?.trim() || "local",
   baseUrl,
-  workspaceId: process.env.HONCHO_WORKSPACE_ID?.trim() || "default",
+  workspaceId: env?.HONCHO_WORKSPACE_ID?.trim() || "default",
 };
 
-const honcho = createClient(config);
-const server = createServer({ honcho, config });
+const server = createServer({
+  config,
+  clientFor: createClientFactory(config),
+  unscoped: createUnscopedClient(config),
+});
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

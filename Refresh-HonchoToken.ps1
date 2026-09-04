@@ -204,7 +204,8 @@ try {
         }
         Write-Log "Container token exp: $(if ($containerExp) { $containerExp.ToString('s') + 'Z' } else { '<unparseable>' }) (${containerTtlMin} min left)$(if ($containerStale) { ' [STALE - recreate required]' })"
     } else {
-        Write-Log 'Could not read token from running container (not running?); relying on .env only.' 'WARN'
+        $containerStale = $true
+        Write-Log 'HONCTOK-007 container token unreadable; forcing api/deriver recreate.' 'WARN'
     }
 
     if (-not $Force -and $currentExp -and $currentTtlMin -gt $NoOpIfCurrentTtlAbove) {
